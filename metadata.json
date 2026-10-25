@@ -1,0 +1,6 @@
+{
+  "name": "ClipGuard",
+  "description": "Toggle clipboard access (READ_CLIPBOARD app-op) for every installed app on MIUI/HyperOS via Shizuku.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
