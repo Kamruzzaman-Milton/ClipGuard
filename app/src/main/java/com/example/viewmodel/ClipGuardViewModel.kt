@@ -11,9 +11,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.model.AppFilter
 import com.example.model.AppItem
+import com.example.model.AppSortOption
 import com.example.model.BatchConfirmation
 import com.example.model.BatchProgressState
 import com.example.model.ClipGuardUiState
+import com.example.model.ClipboardPermissionState
 import com.example.model.ShizukuStatus
 import com.example.shizuku.ShizukuAppOpsManager
 import java.util.concurrent.ConcurrentHashMap
@@ -50,7 +52,7 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
                 val oldStatus = _uiState.value.shizukuStatus
                 _uiState.update { it.copy(shizukuStatus = newStatus) }
                 if (oldStatus != newStatus && newStatus is ShizukuStatus.Ready) {
-                    refreshAppOpsOnly()
+                    refreshAppOpsAndUsage()
                 }
             }
         }
@@ -61,7 +63,7 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
         val prev = _uiState.value.shizukuStatus
         val current = shizukuManager.refreshStatus()
         if (prev != current && current is ShizukuStatus.Ready) {
-            refreshAppOpsOnly()
+            refreshAppOpsAndUsage()
         }
     }
 
@@ -73,6 +75,8 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
 
             val loadedApps = withContext(Dispatchers.IO) {
                 val pm = getApplication<Application>().packageManager
+                val usageMap = shizukuManager.getAppUsageStatsMap()
+
                 val rawApps = try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         pm.getInstalledApplications(
@@ -98,7 +102,22 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
                         val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
                             (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
 
-                        val isAllowed = shizukuManager.isClipboardAllowed(appInfo.uid, pkg)
+                        val permState = shizukuManager.getClipboardState(appInfo.uid, pkg)
+
+                        val pkgInfo = runCatching {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                pm.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(0L))
+                            } else {
+                                @Suppress("DEPRECATION")
+                                pm.getPackageInfo(pkg, 0)
+                            }
+                        }.getOrNull()
+
+                        val firstInstall = pkgInfo?.firstInstallTime ?: 0L
+                        val lastUpdate = pkgInfo?.lastUpdateTime ?: 0L
+                        val usage = usageMap[pkg]
+                        val totalUsageTime = usage?.totalForegroundTimeMs ?: 0L
+                        val lastUsed = usage?.lastTimeUsedMs ?: 0L
 
                         val iconBitmap = iconCache[pkg] ?: runCatching {
                             val drawable = pm.getApplicationIcon(appInfo)
@@ -112,14 +131,14 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
                             appName = label,
                             uid = appInfo.uid,
                             isSystemApp = isSystem,
-                            isClipboardAllowed = isAllowed,
-                            icon = iconBitmap
+                            permissionState = permState,
+                            icon = iconBitmap,
+                            firstInstallTime = firstInstall,
+                            lastUpdateTime = lastUpdate,
+                            totalForegroundTimeMs = totalUsageTime,
+                            lastTimeUsedMs = lastUsed
                         )
                     }
-                    .sortedWith(
-                        compareBy<AppItem, String>(String.CASE_INSENSITIVE_ORDER) { it.appName }
-                            .thenBy { it.packageName }
-                    )
                     .toList()
             }
 
@@ -132,20 +151,22 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun refreshAppOpsOnly() {
+    private fun refreshAppOpsAndUsage() {
         val currentList = _uiState.value.allApps
         if (currentList.isEmpty()) {
             loadAllApps()
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
+            val usageMap = shizukuManager.getAppUsageStatsMap()
             val updated = currentList.map { app ->
-                val allowed = shizukuManager.isClipboardAllowed(app.uid, app.packageName)
-                if (allowed != app.isClipboardAllowed) {
-                    app.copy(isClipboardAllowed = allowed)
-                } else {
-                    app
-                }
+                val permState = shizukuManager.getClipboardState(app.uid, app.packageName)
+                val usage = usageMap[app.packageName]
+                app.copy(
+                    permissionState = permState,
+                    totalForegroundTimeMs = usage?.totalForegroundTimeMs ?: app.totalForegroundTimeMs,
+                    lastTimeUsedMs = usage?.lastTimeUsedMs ?: app.lastTimeUsedMs
+                )
             }
             _uiState.update { it.copy(allApps = updated) }
         }
@@ -157,6 +178,19 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun selectFilter(filter: AppFilter) {
         _uiState.update { it.copy(selectedFilter = filter) }
+    }
+
+    fun selectSort(sort: AppSortOption) {
+        _uiState.update { it.copy(selectedSort = sort) }
+        if (sort == AppSortOption.MOST_USED || sort == AppSortOption.RECENTLY_USED) {
+            viewModelScope.launch {
+                withContext(Dispatchers.IO) {
+                    if (shizukuManager.ensureUsageStatsPermissionGranted()) {
+                        refreshAppOpsAndUsage()
+                    }
+                }
+            }
+        }
     }
 
     fun handleShizukuBannerAction() {
@@ -171,23 +205,31 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
             ShizukuStatus.PermissionDenied -> {
                 shizukuManager.requestShizukuPermission()
             }
-            ShizukuStatus.Ready -> refreshAppOpsOnly()
+            ShizukuStatus.Ready -> refreshAppOpsAndUsage()
         }
     }
 
     /**
-     * Optimistically toggles READ_CLIPBOARD for a single app and rolls back with a toast on failure.
+     * Toggles READ_CLIPBOARD for a single app:
+     * - ON: transitions from "Decide for me" / "Deny" to "While using the app" (MODE_FOREGROUND)
+     * - OFF: transitions to "Deny" (MODE_IGNORED)
      */
     fun toggleAppClipboard(app: AppItem, newAllowed: Boolean) {
-        val previousAllowed = app.isClipboardAllowed
-        if (previousAllowed == newAllowed) return
+        val previousState = app.permissionState
+        if (previousState.isAllowed == newAllowed) return
+
+        val targetState = if (newAllowed) {
+            ClipboardPermissionState.FOREGROUND
+        } else {
+            ClipboardPermissionState.DENIED
+        }
 
         // Optimistic UI update
         _uiState.update { state ->
             state.copy(
                 allApps = state.allApps.map { item ->
                     if (item.packageName == app.packageName && item.uid == app.uid) {
-                        item.copy(isClipboardAllowed = newAllowed, isToggling = true)
+                        item.copy(permissionState = targetState, isToggling = true)
                     } else {
                         item
                     }
@@ -205,11 +247,18 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
             }
 
             if (result.isSuccess) {
+                // Re-fetch actual state to confirm
+                val actualState = withContext(Dispatchers.IO) {
+                    shizukuManager.getClipboardState(app.uid, app.packageName)
+                }
                 _uiState.update { state ->
                     state.copy(
                         allApps = state.allApps.map { item ->
                             if (item.packageName == app.packageName && item.uid == app.uid) {
-                                item.copy(isClipboardAllowed = newAllowed, isToggling = false)
+                                item.copy(
+                                    permissionState = if (actualState.isAllowed == newAllowed) actualState else targetState,
+                                    isToggling = false
+                                )
                             } else {
                                 item
                             }
@@ -222,7 +271,7 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
                     state.copy(
                         allApps = state.allApps.map { item ->
                             if (item.packageName == app.packageName && item.uid == app.uid) {
-                                item.copy(isClipboardAllowed = previousAllowed, isToggling = false)
+                                item.copy(permissionState = previousState, isToggling = false)
                             } else {
                                 item
                             }
@@ -280,7 +329,8 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             var successCount = 0
             var failureCount = 0
-            val succeededPackages = HashMap<String, Boolean>(targets.size)
+            val targetState = if (allow) ClipboardPermissionState.FOREGROUND else ClipboardPermissionState.DENIED
+            val succeededPackages = HashMap<String, ClipboardPermissionState>(targets.size)
 
             withContext(Dispatchers.IO) {
                 targets.forEachIndexed { index, target ->
@@ -302,7 +352,7 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                     if (res.isSuccess) {
                         successCount++
-                        succeededPackages[target.packageName] = allow
+                        succeededPackages[target.packageName] = targetState
                     } else {
                         failureCount++
                     }
@@ -315,7 +365,7 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
                     allApps = state.allApps.map { app ->
                         val newState = succeededPackages[app.packageName]
                         if (newState != null) {
-                            app.copy(isClipboardAllowed = newState, isToggling = false)
+                            app.copy(permissionState = newState, isToggling = false)
                         } else {
                             app
                         }
@@ -323,9 +373,9 @@ class ClipGuardViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
 
-            val actionWord = if (allow) "Allowed" else "Blocked"
+            val actionWord = if (allow) "Enabled 'While using app' for" else "Blocked"
             val summary = if (failureCount == 0) {
-                "$actionWord clipboard for $successCount apps"
+                "$actionWord $successCount apps"
             } else {
                 "$actionWord $successCount apps ($failureCount failed)"
             }

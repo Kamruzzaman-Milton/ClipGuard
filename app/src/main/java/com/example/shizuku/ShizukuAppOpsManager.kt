@@ -1,12 +1,14 @@
 package com.example.shizuku
 
 import android.app.AppOpsManager
+import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import com.example.model.ClipboardPermissionState
 import com.example.model.ShizukuStatus
 import java.lang.reflect.Method
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,6 +18,11 @@ import org.lsposed.hiddenapibypass.HiddenApiBypass
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
 import rikka.shizuku.SystemServiceHelper
+
+data class AppUsageInfo(
+    val totalForegroundTimeMs: Long = 0L,
+    val lastTimeUsedMs: Long = 0L
+)
 
 class ShizukuAppOpsManager(private val context: Context) {
 
@@ -91,6 +98,9 @@ class ShizukuAppOpsManager(private val context: Context) {
     fun refreshStatus(): ShizukuStatus {
         val current = evaluateStatus()
         _status.value = current
+        if (current is ShizukuStatus.Ready) {
+            ensureUsageStatsPermissionGranted()
+        }
         return current
     }
 
@@ -239,11 +249,14 @@ class ShizukuAppOpsManager(private val context: Context) {
     }
 
     /**
-     * Checks whether READ_CLIPBOARD is currently allowed (MODE_ALLOWED) for the given package.
-     * Uses Shizuku-wrapped IAppOpsService.checkOperation(op, uid, packageName) when Ready,
-     * with a safe fallback to local AppOpsManager so the app list never crashes.
+     * Resolves the exact ClipboardPermissionState for the given package and UID.
+     * Maps to MIUI's 4 stages:
+     * - FOREGROUND (4): "While using the app"
+     * - ALLOWED (0): "Always allow"
+     * - DEFAULT (3): "Decide for me" (blank)
+     * - DENIED (1): "Deny"
      */
-    fun isClipboardAllowed(uid: Int, packageName: String): Boolean {
+    fun getClipboardState(uid: Int, packageName: String): ClipboardPermissionState {
         if (_status.value.isReady) {
             try {
                 val service = getOrCreateAppOpsService()
@@ -256,7 +269,13 @@ class ShizukuAppOpsManager(private val context: Context) {
                     )
                 val mode = checkMethod.invoke(service, readClipboardOp, uid, packageName) as? Int
                 if (mode != null) {
-                    return mode == AppOpsManager.MODE_ALLOWED
+                    return when (mode) {
+                        0 -> ClipboardPermissionState.ALLOWED
+                        4 -> ClipboardPermissionState.FOREGROUND
+                        3 -> ClipboardPermissionState.DEFAULT
+                        1, 2 -> ClipboardPermissionState.DENIED
+                        else -> if (mode == 4) ClipboardPermissionState.FOREGROUND else ClipboardPermissionState.DEFAULT
+                    }
                 }
             } catch (_: Throwable) {
                 invalidateServiceCache()
@@ -264,28 +283,49 @@ class ShizukuAppOpsManager(private val context: Context) {
             }
         }
 
-        return checkLocalFallback(uid, packageName)
+        return checkLocalFallbackState(uid, packageName)
     }
 
-    private fun checkLocalFallback(uid: Int, packageName: String): Boolean {
+    private fun checkLocalFallbackState(uid: Int, packageName: String): ClipboardPermissionState {
         return try {
             val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
-                ?: return true
+                ?: return ClipboardPermissionState.DEFAULT
             val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 appOps.unsafeCheckOpNoThrow(OP_READ_CLIPBOARD_STR, uid, packageName)
             } else {
                 @Suppress("DEPRECATION")
                 appOps.checkOpNoThrow(OP_READ_CLIPBOARD_STR, uid, packageName)
             }
-            mode == AppOpsManager.MODE_ALLOWED
+            when (mode) {
+                AppOpsManager.MODE_ALLOWED -> ClipboardPermissionState.ALLOWED
+                4 -> ClipboardPermissionState.FOREGROUND
+                AppOpsManager.MODE_IGNORED, AppOpsManager.MODE_ERRORED -> ClipboardPermissionState.DENIED
+                AppOpsManager.MODE_DEFAULT -> ClipboardPermissionState.DEFAULT
+                else -> ClipboardPermissionState.DEFAULT
+            }
         } catch (_: Throwable) {
-            true
+            ClipboardPermissionState.DEFAULT
         }
     }
 
+    private fun executeShizukuProcess(cmd: Array<String>): Process? {
+        return runCatching {
+            val method = Shizuku::class.java.getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            )
+            method.isAccessible = true
+            method.invoke(null, cmd, null, null) as? Process
+        }.getOrNull()
+    }
+
     /**
-     * Sets READ_CLIPBOARD mode via Shizuku-wrapped IAppOpsService.setMode(op, uid, packageName, mode).
-     * Modes: MODE_ALLOWED = allow, MODE_IGNORED = block.
+     * Sets READ_CLIPBOARD mode via Shizuku.
+     * On MIUI / HyperOS, toggling ON sets permission from "Decide for me" (blank)
+     * to "While using the app" (MODE_FOREGROUND = 4, shell argument 'foreground').
+     * Toggling OFF sets permission to "Deny" (MODE_IGNORED = 1, shell argument 'ignore').
      */
     fun setClipboardAllowed(uid: Int, packageName: String, allow: Boolean): Result<Unit> {
         val currentStatus = refreshStatus()
@@ -295,36 +335,168 @@ class ShizukuAppOpsManager(private val context: Context) {
             )
         }
 
-        val targetMode = if (allow) AppOpsManager.MODE_ALLOWED else AppOpsManager.MODE_IGNORED
+        val modeStr = if (allow) "foreground" else "ignore"
+        val targetModeInt = if (allow) 4 else AppOpsManager.MODE_IGNORED
 
-        return try {
-            val service = getOrCreateAppOpsService()
-            val setMode = cachedSetModeMethod
-                ?: service.javaClass.getMethod(
-                    "setMode",
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                    String::class.java,
-                    Int::class.javaPrimitiveType
-                )
-            setMode.invoke(service, readClipboardOp, uid, packageName, targetMode)
+        var cmdExecuted = false
+        var lastError: Throwable? = null
 
-            // Verify the operation took effect via checkOperation
-            val checkMethod = cachedCheckOperationMethod
-            if (checkMethod != null) {
-                val updatedMode =
-                    checkMethod.invoke(service, readClipboardOp, uid, packageName) as? Int
-                if (updatedMode != null && updatedMode != targetMode) {
-                    // On some MIUI/HyperOS builds, UID mode overrides package mode
-                    cachedSetUidModeMethod?.invoke(service, readClipboardOp, uid, targetMode)
+        // 1. Run canonical Shizuku ADB shell command: cmd appops set <pkg> READ_CLIPBOARD <foreground|ignore>
+        try {
+            val proc = executeShizukuProcess(
+                arrayOf("cmd", "appops", "set", packageName, "READ_CLIPBOARD", modeStr)
+            )
+            if (proc != null) {
+                val exitCode = proc.waitFor()
+                if (exitCode == 0) {
+                    cmdExecuted = true
+                } else {
+                    val err = proc.errorStream.bufferedReader().use { it.readText() }.trim()
+                    if (err.isNotBlank()) {
+                        lastError = Exception(err)
+                    }
                 }
             }
-            Result.success(Unit)
-        } catch (t: Throwable) {
-            invalidateServiceCache()
-            refreshStatus()
-            val rootCause = t.cause ?: t
-            Result.failure(rootCause)
+        } catch (e: Throwable) {
+            lastError = e
+        }
+
+        // Also update UID mode for consistency across multi-user/dual apps/secondary spaces
+        runCatching {
+            executeShizukuProcess(
+                arrayOf("cmd", "appops", "set", "--uid", uid.toString(), "READ_CLIPBOARD", modeStr)
+            )?.waitFor()
+        }
+
+        // 2. Also invoke IAppOpsService IPC directly
+        runCatching {
+            val service = getOrCreateAppOpsService()
+            cachedSetModeMethod?.invoke(service, readClipboardOp, uid, packageName, targetModeInt)
+            cachedSetUidModeMethod?.invoke(service, readClipboardOp, uid, targetModeInt)
+        }
+
+        if (cmdExecuted) {
+            return Result.success(Unit)
+        }
+
+        if (lastError != null) {
+            return Result.failure(lastError)
+        }
+        return Result.success(Unit)
+    }
+
+    /**
+     * Checks if PACKAGE_USAGE_STATS is granted to this app.
+     */
+    fun hasUsageStatsPermission(): Boolean {
+        return try {
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
+                ?: return false
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                appOps.unsafeCheckOpNoThrow(
+                    AppOpsManager.OPSTR_GET_USAGE_STATS,
+                    android.os.Process.myUid(),
+                    context.packageName
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                appOps.checkOpNoThrow(
+                    AppOpsManager.OPSTR_GET_USAGE_STATS,
+                    android.os.Process.myUid(),
+                    context.packageName
+                )
+            }
+            mode == AppOpsManager.MODE_ALLOWED
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Automatically grants PACKAGE_USAGE_STATS to ClipGuard via Shizuku ADB commands and Binder IPC.
+     */
+    fun ensureUsageStatsPermissionGranted(): Boolean {
+        if (hasUsageStatsPermission()) return true
+        if (!_status.value.isReady) return false
+
+        val pkg = context.packageName
+
+        // Try direct Binder IPC to AppOps service for OP_GET_USAGE_STATS (code 43)
+        runCatching {
+            val service = getOrCreateAppOpsService()
+            cachedSetModeMethod?.invoke(
+                service,
+                43, // OP_GET_USAGE_STATS
+                android.os.Process.myUid(),
+                pkg,
+                AppOpsManager.MODE_ALLOWED
+            )
+        }
+
+        // Try direct Binder IPC to PackageManager for grantRuntimePermission
+        runCatching {
+            val raw = SystemServiceHelper.getSystemService("package") ?: return@runCatching
+            val wrapped = ShizukuBinderWrapper(raw)
+            val stub = Class.forName("android.content.pm.IPackageManager\$Stub")
+            val asInterface = stub.getMethod("asInterface", IBinder::class.java)
+            val pmService = asInterface.invoke(null, wrapped) ?: return@runCatching
+            val grantMethod = pmService.javaClass.getMethod(
+                "grantRuntimePermission",
+                String::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType
+            )
+            grantMethod.invoke(pmService, pkg, "android.permission.PACKAGE_USAGE_STATS", 0)
+        }
+
+        // Run ADB shell commands via Shizuku process
+        runCatching {
+            executeShizukuProcess(
+                arrayOf("cmd", "appops", "set", pkg, "GET_USAGE_STATS", "allow")
+            )?.waitFor()
+        }
+        runCatching {
+            executeShizukuProcess(
+                arrayOf("pm", "grant", pkg, "android.permission.PACKAGE_USAGE_STATS")
+            )?.waitFor()
+        }
+        return hasUsageStatsPermission()
+    }
+
+    /**
+     * Retrieves usage statistics map for all packages over the past 30 days.
+     */
+    fun getAppUsageStatsMap(): Map<String, AppUsageInfo> {
+        if (!hasUsageStatsPermission()) {
+            ensureUsageStatsPermissionGranted()
+        }
+        if (!hasUsageStatsPermission()) {
+            return emptyMap()
+        }
+        return try {
+            val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                ?: return emptyMap()
+            val endTime = System.currentTimeMillis()
+            val startTime = endTime - 30L * 24 * 60 * 60 * 1000L // 30 days
+            val statsList = usageStatsManager.queryUsageStats(
+                UsageStatsManager.INTERVAL_BEST,
+                startTime,
+                endTime
+            ) ?: emptyList()
+
+            val map = HashMap<String, AppUsageInfo>(statsList.size)
+            for (stat in statsList) {
+                val existing = map[stat.packageName]
+                val totalTime = (existing?.totalForegroundTimeMs ?: 0L) + stat.totalTimeInForeground
+                val lastUsed = maxOf(existing?.lastTimeUsedMs ?: 0L, stat.lastTimeUsed)
+                map[stat.packageName] = AppUsageInfo(
+                    totalForegroundTimeMs = totalTime,
+                    lastTimeUsedMs = lastUsed
+                )
+            }
+            map
+        } catch (_: Throwable) {
+            emptyMap()
         }
     }
 }

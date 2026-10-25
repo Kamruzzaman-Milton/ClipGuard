@@ -1,5 +1,6 @@
 package com.example.ui
 
+import android.text.format.DateUtils
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -38,6 +39,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Sort
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Clear
 import androidx.compose.material.icons.outlined.ContentPasteOff
@@ -66,15 +69,16 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.DpRect
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.model.AppFilter
 import com.example.model.AppItem
+import com.example.model.AppSortOption
 import com.example.model.BatchConfirmation
 import com.example.model.BatchProgressState
+import com.example.model.ClipboardPermissionState
 import com.example.model.ShizukuStatus
 import com.example.ui.theme.AmoledCardSurface
 import com.example.ui.theme.AmoledDivider
@@ -88,9 +92,11 @@ import com.example.ui.theme.StatusDanger
 import com.example.ui.theme.StatusSuccess
 import com.example.ui.theme.StatusWarning
 import com.example.viewmodel.ClipGuardViewModel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InfiniteProgressIndicator
@@ -123,6 +129,7 @@ fun ClipGuardScreen(
 
     val scrollBehavior = MiuixScrollBehavior(rememberTopAppBarState())
     var showActionMenuDialog by remember { mutableStateOf(false) }
+    var showSortDialog by remember { mutableStateOf(false) }
     val showConfirmDialog = remember { mutableStateOf(false) }
     val showProgressDialog = remember { mutableStateOf(false) }
 
@@ -132,7 +139,8 @@ fun ClipGuardScreen(
     val filteredApps = remember(
         uiState.allApps,
         uiState.searchQuery,
-        uiState.selectedFilter
+        uiState.selectedFilter,
+        uiState.selectedSort
     ) {
         uiState.filteredApps
     }
@@ -152,6 +160,18 @@ fun ClipGuardScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
+                        IconButton(
+                            onClick = { showSortDialog = true },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("sort_apps_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Outlined.Sort,
+                                contentDescription = "Sort Apps",
+                                tint = if (uiState.selectedSort != AppSortOption.NAME) HyperBlue else MiuixTheme.colorScheme.onBackground
+                            )
+                        }
                         IconButton(
                             onClick = { viewModel.loadAllApps() },
                             modifier = Modifier
@@ -214,7 +234,9 @@ fun ClipGuardScreen(
                     shizukuStatus = uiState.shizukuStatus,
                     filteredCount = filteredApps.size,
                     blockedCount = uiState.blockedCount,
+                    selectedSort = uiState.selectedSort,
                     isDark = isDark,
+                    onOpenSort = { showSortDialog = true },
                     onQuickAllowAll = { viewModel.requestBatchOperation(allow = true) },
                     onQuickBlockAll = { viewModel.requestBatchOperation(allow = false) },
                     modifier = Modifier
@@ -280,7 +302,7 @@ fun ClipGuardScreen(
                     onSelectFilter = { viewModel.selectFilter(it) },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 6.dp)
+                        .padding(vertical = 4.dp)
                 )
 
                 // Main content area: Loading / Empty / LazyColumn of apps
@@ -297,7 +319,7 @@ fun ClipGuardScreen(
                         ) {
                             InfiniteProgressIndicator()
                             Text(
-                                text = "Scanning installed packages…",
+                                text = "Scanning packages and permissions…",
                                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                                 fontSize = 14.sp
                             )
@@ -349,6 +371,7 @@ fun ClipGuardScreen(
                         ) { app ->
                             AppPermissionCard(
                                 app = app,
+                                currentSort = uiState.selectedSort,
                                 isDark = isDark,
                                 onToggle = { allowed ->
                                     viewModel.toggleAppClipboard(app, allowed)
@@ -363,6 +386,77 @@ fun ClipGuardScreen(
                     }
                 }
             }
+        }
+    }
+
+    // Sort Options Dialog
+    val sortDialogState = remember { mutableStateOf(false) }
+    sortDialogState.value = showSortDialog
+    SuperDialog(
+        title = "Sort Apps",
+        summary = "Usage stats auto-granted via Shizuku",
+        show = sortDialogState,
+        onDismissRequest = { showSortDialog = false }
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            AppSortOption.entries.forEach { option ->
+                val isSelected = option == uiState.selectedSort
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(
+                            if (isSelected) HyperBlue.copy(alpha = 0.12f)
+                            else if (isDark) AmoledCardSurface else LightSecondarySurface
+                        )
+                        .border(
+                            width = 1.dp,
+                            color = if (isSelected) HyperBlue else if (isDark) AmoledDivider else LightDivider,
+                            shape = RoundedCornerShape(14.dp)
+                        )
+                        .clickable {
+                            showSortDialog = false
+                            viewModel.selectSort(option)
+                        }
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                        .testTag("sort_option_${option.name}"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = option.displayName,
+                            color = if (isSelected) HyperBlue else MiuixTheme.colorScheme.onSurface,
+                            fontSize = 15.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                        )
+                        Text(
+                            text = option.subtitle,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            fontSize = 12.sp
+                        )
+                    }
+                    if (isSelected) {
+                        Icon(
+                            imageVector = Icons.Outlined.Check,
+                            contentDescription = "Selected",
+                            tint = HyperBlue,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            TextButton(
+                text = stringResource(R.string.dialog_cancel),
+                onClick = { showSortDialog = false },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("sort_cancel_button")
+            )
         }
     }
 
@@ -381,7 +475,7 @@ fun ClipGuardScreen(
         ) {
             MenuOptionRow(
                 title = stringResource(R.string.action_allow_all),
-                subtitle = "Set READ_CLIPBOARD to MODE_ALLOWED for ${filteredApps.size} filtered apps",
+                subtitle = "Set to 'While using the app' for ${filteredApps.size} apps",
                 icon = Icons.Outlined.DoneAll,
                 accentColor = HyperBlue,
                 isDark = isDark,
@@ -393,7 +487,7 @@ fun ClipGuardScreen(
             )
             MenuOptionRow(
                 title = stringResource(R.string.action_block_all),
-                subtitle = "Set READ_CLIPBOARD to MODE_IGNORED for ${filteredApps.size} filtered apps",
+                subtitle = "Set to 'Deny' for ${filteredApps.size} apps",
                 icon = Icons.Outlined.ContentPasteOff,
                 accentColor = StatusDanger,
                 isDark = isDark,
@@ -423,7 +517,7 @@ fun ClipGuardScreen(
             stringResource(R.string.dialog_block_all_title)
         },
         summary = if (confirmation != null) {
-            val modeName = if (confirmation.allow) "MODE_ALLOWED (Allow)" else "MODE_IGNORED (Block)"
+            val modeName = if (confirmation.allow) "'While using the app'" else "'Deny'"
             "Apply $modeName to ${confirmation.targetApps.size} apps in the current filtered list?"
         } else {
             ""
@@ -498,12 +592,12 @@ private fun ShizukuStatusBanner(
     onActionClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val (title, description, buttonLabel, accentColor, icon) = when (status) {
+    val spec = when (status) {
         ShizukuStatus.NotInstalled -> BannerSpec(
             title = stringResource(R.string.shizuku_not_installed_title),
             description = stringResource(R.string.shizuku_not_installed_desc),
             actionText = stringResource(R.string.shizuku_action_install),
-            accent = StatusDanger,
+            accent = StatusWarning,
             icon = Icons.Outlined.ErrorOutline
         )
         ShizukuStatus.NotRunning -> BannerSpec(
@@ -527,23 +621,27 @@ private fun ShizukuStatusBanner(
             accent = StatusDanger,
             icon = Icons.Outlined.ErrorOutline
         )
-        ShizukuStatus.Ready -> return
+        ShizukuStatus.Ready -> BannerSpec(
+            title = stringResource(R.string.shizuku_ready_badge),
+            description = "",
+            actionText = "",
+            accent = StatusSuccess,
+            icon = Icons.Outlined.CheckCircle
+        )
     }
 
-    Card(
+    Box(
         modifier = modifier
+            .clip(RoundedCornerShape(18.dp))
+            .background(if (isDark) AmoledCardSurface else LightCardSurface)
             .border(
                 width = 1.dp,
-                color = if (isDark) AmoledDivider else LightDivider,
-                shape = RoundedCornerShape(20.dp)
+                color = spec.accent.copy(alpha = 0.5f),
+                shape = RoundedCornerShape(18.dp)
             )
-            .testTag("shizuku_status_banner"),
-        cornerRadius = 20.dp,
-        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-        color = if (isDark) AmoledCardSurface else LightCardSurface
+            .padding(14.dp)
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -551,51 +649,37 @@ private fun ShizukuStatusBanner(
                 modifier = Modifier
                     .size(40.dp)
                     .clip(CircleShape)
-                    .background(
-                        if (isDark) AmoledElevatedSurface else accentColor.copy(alpha = 0.14f)
-                    ),
+                    .background(spec.accent.copy(alpha = 0.15f)),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = icon,
+                    imageVector = spec.icon,
                     contentDescription = null,
-                    tint = accentColor,
+                    tint = spec.accent,
                     modifier = Modifier.size(22.dp)
                 )
             }
-
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = title,
+                    text = spec.title,
                     color = MiuixTheme.colorScheme.onSurface,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold
+                    style = ClipGuardTypography.appTitle
                 )
-                Text(
-                    text = description,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                    fontSize = 12.sp,
-                    lineHeight = 16.sp
-                )
+                if (spec.description.isNotBlank()) {
+                    Text(
+                        text = spec.description,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        style = ClipGuardTypography.packageMono,
+                        lineHeight = 16.sp
+                    )
+                }
             }
-
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(HyperBlue)
-                    .clickable(onClick = onActionClick)
-                    .padding(horizontal = 14.dp, vertical = 9.dp)
-                    .testTag("shizuku_banner_action_button"),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = buttonLabel,
-                    color = Color.White,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold
+            if (spec.actionText.isNotBlank()) {
+                TextButton(
+                    text = spec.actionText,
+                    onClick = onActionClick,
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
+                    modifier = Modifier.testTag("shizuku_banner_action_button")
                 )
             }
         }
@@ -615,7 +699,9 @@ private fun SummaryHeaderRow(
     shizukuStatus: ShizukuStatus,
     filteredCount: Int,
     blockedCount: Int,
+    selectedSort: AppSortOption,
     isDark: Boolean,
+    onOpenSort: () -> Unit,
     onQuickAllowAll: () -> Unit,
     onQuickBlockAll: () -> Unit,
     modifier: Modifier = Modifier
@@ -627,7 +713,8 @@ private fun SummaryHeaderRow(
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.clickable(onClick = onOpenSort)
         ) {
             Box(
                 modifier = Modifier
@@ -638,11 +725,7 @@ private fun SummaryHeaderRow(
                     )
             )
             Text(
-                text = if (shizukuStatus.isReady) {
-                    "Shizuku Active • $filteredCount shown ($blockedCount blocked)"
-                } else {
-                    "$filteredCount apps shown • $blockedCount blocked"
-                },
+                text = "$filteredCount apps • ${selectedSort.displayName} ▾",
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium
@@ -757,15 +840,36 @@ private fun FilterChipsRow(
                         shape = RoundedCornerShape(14.dp)
                     )
                     .clickable { onSelectFilter(filter) }
-                    .padding(horizontal = 14.dp, vertical = 8.dp)
-                    .testTag("filter_chip_${filter.name.lowercase()}"),
-                contentAlignment = Alignment.Center
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+                    .testTag("filter_chip_${filter.name}")
             ) {
-                Text(
-                    text = "${filter.labelResName} ($count)",
-                    color = textColor,
-                    style = ClipGuardTypography.chipLabel
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = filter.labelResName,
+                        color = textColor,
+                        fontSize = 13.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                    )
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(
+                                if (selected) Color.White.copy(alpha = 0.25f)
+                                else if (isDark) AmoledElevatedSurface else LightCardSurface
+                            )
+                            .padding(horizontal = 6.dp, vertical = 1.dp)
+                    ) {
+                        Text(
+                            text = count.toString(),
+                            color = if (selected) Color.White else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
             }
         }
     }
@@ -774,27 +878,24 @@ private fun FilterChipsRow(
 @Composable
 private fun AppPermissionCard(
     app: AppItem,
+    currentSort: AppSortOption,
     isDark: Boolean,
-    onToggle: (Boolean) -> Unit
+    onToggle: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Card(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .border(
-                width = 1.dp,
-                color = if (isDark) AmoledDivider else LightDivider,
-                shape = RoundedCornerShape(20.dp)
-            )
-            .clickable { onToggle(!app.isClipboardAllowed) }
             .testTag("app_card_${app.packageName}"),
-        cornerRadius = 20.dp,
-        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 13.dp),
-        color = if (isDark) AmoledCardSurface else LightCardSurface
+        color = if (isDark) AmoledCardSurface else LightCardSurface,
+        cornerRadius = 18.dp
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp)
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // App Icon
             if (app.icon != null) {
@@ -826,7 +927,7 @@ private fun AppPermissionCard(
                 }
             }
 
-            // App Name + Package Name + Badges
+            // App Name + Badges + Metric Subtitle
             Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(3.dp)
@@ -868,9 +969,60 @@ private fun AppPermissionCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+
+                // Subtitle row: MIUI permission stage tag + sort metric
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(top = 2.dp)
+                ) {
+                    // MIUI Permission Stage Tag
+                    val (stageColor, stageBg) = when (app.permissionState) {
+                        ClipboardPermissionState.FOREGROUND -> Pair(HyperBlue, HyperBlue.copy(alpha = 0.12f))
+                        ClipboardPermissionState.ALLOWED -> Pair(StatusSuccess, StatusSuccess.copy(alpha = 0.12f))
+                        ClipboardPermissionState.DEFAULT -> Pair(
+                            MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            if (isDark) AmoledElevatedSurface else LightSecondarySurface
+                        )
+                        ClipboardPermissionState.DENIED -> Pair(StatusDanger, StatusDanger.copy(alpha = 0.12f))
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(stageBg)
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = app.permissionState.label,
+                            color = stageColor,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    // Metric text depending on sort option
+                    val metricText = when (currentSort) {
+                        AppSortOption.NAME -> null
+                        AppSortOption.RECENTLY_UPDATED -> "Updated ${formatDate(app.lastUpdateTime)}"
+                        AppSortOption.RECENTLY_INSTALLED -> "Installed ${formatDate(app.firstInstallTime)}"
+                        AppSortOption.MOST_USED -> "Usage: ${formatDuration(app.totalForegroundTimeMs)}"
+                        AppSortOption.RECENTLY_USED -> "Used ${formatRelativeTime(app.lastTimeUsedMs)}"
+                    }
+
+                    if (metricText != null) {
+                        Text(
+                            text = "•  $metricText",
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
             }
 
-            // Single Miuix Switch (ON = allowed, OFF = blocked)
+            // Switch (ON = "While using the app" / allowed, OFF = "Deny")
             Switch(
                 checked = app.isClipboardAllowed,
                 onCheckedChange = { newAllowed -> onToggle(newAllowed) },
@@ -927,4 +1079,36 @@ private fun MenuOptionRow(
             )
         }
     }
+}
+
+private fun formatDate(timestamp: Long): String {
+    if (timestamp <= 0L) return "Unknown"
+    val sdf = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
+    return sdf.format(Date(timestamp))
+}
+
+private fun formatDuration(millis: Long): String {
+    if (millis <= 0L) return "0m"
+    val minutes = millis / (1000 * 60)
+    val hours = minutes / 60
+    val remMin = minutes % 60
+    return when {
+        hours > 0 && remMin > 0 -> "${hours}h ${remMin}m"
+        hours > 0 -> "${hours}h"
+        minutes > 0 -> "${minutes}m"
+        else -> "< 1m"
+    }
+}
+
+private fun formatRelativeTime(millis: Long): String {
+    if (millis <= 0L) return "Never"
+    val now = System.currentTimeMillis()
+    val diff = now - millis
+    if (diff < 0L) return "Just now"
+    return DateUtils.getRelativeTimeSpanString(
+        millis,
+        now,
+        DateUtils.MINUTE_IN_MILLIS,
+        DateUtils.FORMAT_ABBREV_RELATIVE
+    ).toString()
 }
